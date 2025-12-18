@@ -6,7 +6,7 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 
 try:
     from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -14,6 +14,11 @@ try:
 except ImportError:  # Playwright no instalado
     async_playwright = None  # type: ignore[assignment]
     PlaywrightTimeoutError = Exception  # type: ignore[assignment]
+
+try:
+    from openpyxl import load_workbook
+except ImportError:  # openpyxl no instalado
+    load_workbook = None  # type: ignore[assignment]
 
 
 LISTING_URL = "https://www.mercadolibre.cl/ventas/omni/listado"
@@ -103,7 +108,21 @@ def open_detail(code: str) -> None:
     ).start()
 
 
-def center_window(win: tk.Tk, width: int = 480, height: int = 320) -> None:
+def select_and_process_excel() -> None:
+    file_path = filedialog.askopenfilename(
+        title="Seleccionar Excel",
+        filetypes=[("Excel", "*.xlsx"), ("Todos los archivos", "*.*")],
+    )
+    if not file_path:
+        return
+    print(f"[excel] Archivo seleccionado: {file_path}")
+    threading.Thread(
+        target=lambda: asyncio.run(process_excel(file_path)),
+        daemon=True,
+    ).start()
+
+
+def center_window(win: tk.Tk, width: int = 520, height: int = 380) -> None:
     win.update_idletasks()
     screen_width = win.winfo_screenwidth()
     screen_height = win.winfo_screenheight()
@@ -167,6 +186,22 @@ def main() -> None:
         cursor="hand2",
     )
     open_button.pack(pady=(0, 18))
+
+    process_button = tk.Button(
+        root,
+        text="Procesar Excel (MercadoLibre)",
+        font=("Segoe UI", 10, "bold"),
+        bg="#9c27b0",
+        fg="#fff",
+        activebackground="#8e24aa",
+        activeforeground="#fff",
+        relief=tk.FLAT,
+        padx=16,
+        pady=8,
+        command=select_and_process_excel,
+        cursor="hand2",
+    )
+    process_button.pack(pady=(0, 14))
 
     # Seccion para abrir detalle por codigo de venta
     detail_frame = tk.Frame(root, bg="#f2f2f2")
@@ -248,12 +283,12 @@ async def open_detail_and_extract(code: str, url: str) -> None:
         page.set_default_timeout(20000)
         await page.goto(url, wait_until="domcontentloaded")
 
-        text = await extract_amount_text(page, "Envíos", timeout_ms=5000)
+        text = await extract_amount_text(page, "Envíos", timeout_ms=2000)
         source = "Envíos"
 
         if text is None:
             # Bonificaciones debería resolverse rápido si no hay Envíos; usa timeout corto
-            text = await extract_amount_text(page, "Bonificaciones", timeout_ms=2000)
+            text = await extract_amount_text(page, "Bonificaciones", timeout_ms=1000)
             source = "Bonificaciones" if text else None
 
         if text is None:
@@ -277,6 +312,124 @@ async def open_detail_and_extract(code: str, url: str) -> None:
         except Exception:
             pass
 
+
+async def process_excel(file_path: str) -> None:
+    if load_workbook is None:
+        print("[excel] Falta openpyxl. Instala con: pip install openpyxl")
+        return
+    if async_playwright is None:
+        print("[excel] Falta Playwright. Instala con: pip install playwright && python -m playwright install")
+        return
+    if REMOTE_DEBUG_PORT is None:
+        print("[excel] No hay puerto de depuracion. Pulsa el boton de login primero.")
+        return
+    if not wait_for_port("localhost", REMOTE_DEBUG_PORT, attempts=10, delay=0.4):
+        print(f"[excel] No se pudo alcanzar el puerto {REMOTE_DEBUG_PORT}.")
+        return
+
+    try:
+        wb = load_workbook(file_path)
+    except Exception as exc:
+        print(f"[excel] No se pudo abrir el archivo: {exc}")
+        return
+
+    if "Reporte" not in wb.sheetnames:
+        print("[excel] No se encontro la hoja 'Reporte'.")
+        return
+
+    ws = wb["Reporte"]
+    max_row = ws.max_row
+
+    endpoint = f"http://localhost:{REMOTE_DEBUG_PORT}"
+    playwright = await async_playwright().start()
+    processed = 0
+    try:
+        browser = await playwright.chromium.connect_over_cdp(endpoint)
+        if not browser.contexts:
+            print("[excel] No hay contextos en Chrome. ¿Cerraste la ventana de login?")
+            return
+        context = browser.contexts[0]
+
+        for row_idx in range(2, max_row + 1):
+            channel = ws.cell(row=row_idx, column=6).value  # F
+            if str(channel).strip().lower() != "mercadolibre":
+                continue
+
+            sale_code = ws.cell(row=row_idx, column=8).value  # H
+            if not sale_code:
+                continue
+
+            url = DETAIL_URL_TEMPLATE.format(code=sale_code)
+            amount = await fetch_amount_for_code(context, sale_code, url)
+            if amount is None:
+                amount = 0
+
+            ws.cell(row=row_idx, column=24).value = amount  # X
+
+            w_raw = ws.cell(row=row_idx, column=23).value  # W
+            w_val = parse_amount(w_raw)
+            w_val = w_val if w_val is not None else 0
+            ws.cell(row=row_idx, column=25).value = w_val + amount  # Y
+
+            processed += 1
+            print(f"[excel] Fila {row_idx} ({sale_code}) -> Envíos: {format_amount(amount)}")
+
+        out_path = Path(file_path)
+        output_file = out_path.with_name(f"{out_path.stem}_con_envios{out_path.suffix}")
+        wb.save(output_file)
+        print(f"[excel] Listo. Filas procesadas: {processed}. Archivo guardado en: {output_file}")
+    except Exception as exc:
+        print(f"[excel] Error procesando Excel: {exc}")
+    finally:
+        try:
+            await playwright.stop()
+        except Exception:
+            pass
+
+
+async def fetch_amount_for_code(context, code: str, url: str) -> int | None:
+    try:
+        page = await context.new_page()
+    except Exception as exc:
+        print(f"[{code}] No se pudo abrir una nueva pestaña: {exc}")
+        return None
+
+    try:
+        page.set_default_timeout(20000)
+        await page.goto(url, wait_until="domcontentloaded")
+
+        text = await extract_amount_text(page, "Envíos", timeout_ms=2000)
+        source = "Envíos"
+
+        if text is None:
+            text = await extract_amount_text(page, "Bonificaciones", timeout_ms=1000)
+            source = "Bonificaciones" if text else None
+
+        if text is None:
+            print(f"[{code}] No se encontraron Envíos ni Bonificaciones. Valor: $ 0")
+            return 0
+
+        parsed = parse_amount(text)
+        if parsed is None:
+            print(f"[{code}] No se pudo interpretar el valor de {source}: {text}")
+            return None
+
+        if parsed < 0:
+            parsed = 0
+
+        print(f"[{code}] Envíos ({source}): {format_amount(parsed)}")
+        return parsed
+    except PlaywrightTimeoutError:
+        print(f"[{code}] Timeout esperando datos. Revisa si hay login pendiente.")
+        return None
+    except Exception as exc:
+        print(f"[{code}] Error extrayendo datos: {exc}")
+        return None
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
 
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -361,6 +514,10 @@ def parse_amount(text: str) -> int | None:
     """
     Convierte un texto como "$ 3.090" o "-$ 2.276" a entero (pesos).
     """
+    if text is None:
+        return None
+    if isinstance(text, (int, float)):
+        return int(text)
     clean = text.replace("\xa0", " ").replace("$", "")
     sign = -1 if "-" in clean else 1
     digits = "".join(ch for ch in clean if ch.isdigit())
