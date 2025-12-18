@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+ml_profile/
+chrome_profile/
+playwright/.cache/
