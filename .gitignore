@@ -3,3 +3,6 @@ __pycache__/
 ml_profile/
 chrome_profile/
 playwright/.cache/
+dist/
+build/
+*.spec

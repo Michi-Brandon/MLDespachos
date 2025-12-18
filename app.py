@@ -2,6 +2,7 @@ import asyncio
 import os
 import socket
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -26,7 +27,14 @@ DETAIL_URL_TEMPLATE = "https://www.mercadolibre.cl/ventas/{code}/detalle"
 LOGIN_URL = "https://www.mercadolibre.cl/ventas/omni/listado"
 
 # Perfil dedicado para el login (con cookies)
-AUTOMATION_PROFILE_DIR = Path(__file__).parent / "ml_profile"
+def _base_dir() -> Path:
+    # Si es un binario PyInstaller, usamos la carpeta del .exe para persistir cookies.
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+BASE_DIR = _base_dir()
+AUTOMATION_PROFILE_DIR = BASE_DIR / "ml_profile"
 
 # Para apertura manual del listado con tu Chrome normal
 DEFAULT_PROFILE_NAME = "Default"
