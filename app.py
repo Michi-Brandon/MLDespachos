@@ -6,7 +6,7 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 
 try:
     from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -108,18 +108,45 @@ def open_detail(code: str) -> None:
     ).start()
 
 
-def select_and_process_excel() -> None:
+def select_and_process_excel(
+    on_progress=None,
+    on_status=None,
+    on_finish=None,
+    cancel_event: threading.Event | None = None,
+) -> None:
     file_path = filedialog.askopenfilename(
         title="Seleccionar Excel",
         filetypes=[("Excel", "*.xlsx"), ("Todos los archivos", "*.*")],
     )
     if not file_path:
+        if on_finish:
+            on_finish(cancelled=False, started=False)
         return
+
+    if on_status:
+        on_status(f"Procesando: {Path(file_path).name}")
     print(f"[excel] Archivo seleccionado: {file_path}")
-    threading.Thread(
-        target=lambda: asyncio.run(process_excel(file_path)),
-        daemon=True,
-    ).start()
+
+    def runner() -> None:
+        cancelled = False
+        try:
+            cancelled = asyncio.run(
+                process_excel(
+                    file_path,
+                    on_progress=on_progress,
+                    on_status=on_status,
+                    cancel_event=cancel_event,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - log unexpected thread error
+            print(f"[excel] Error no controlado: {exc}")
+            if on_status:
+                on_status(f"Error: {exc}")
+        finally:
+            if on_finish:
+                on_finish(cancelled, started=True)
+
+    threading.Thread(target=runner, daemon=True).start()
 
 
 def center_window(win: tk.Tk, width: int = 520, height: int = 380) -> None:
@@ -149,7 +176,7 @@ def main() -> None:
 
     description = tk.Label(
         root,
-        text="1) Inicia sesion (boton abajo). 2) Abre detalle y lee Envíos.",
+        text="1) Inicia sesion (boton abajo). 2) Procesa tu Excel de MercadoLibre.",
         font=("Segoe UI", 9),
         bg="#f2f2f2",
     )
@@ -171,21 +198,95 @@ def main() -> None:
     )
     login_button.pack(pady=(0, 14))
 
-    open_button = tk.Button(
-        root,
-        text="Abrir listado (omni)",
-        font=("Segoe UI", 10, "bold"),
-        bg="#ffc107",
-        fg="#000",
-        activebackground="#ffb300",
-        activeforeground="#000",
-        relief=tk.FLAT,
-        padx=16,
-        pady=8,
-        command=open_listing,
-        cursor="hand2",
+    progress_var = tk.StringVar(value="Progreso: 0/0")
+    status_var = tk.StringVar(value="Listo para procesar.")
+
+    progress_frame = tk.Frame(root, bg="#f2f2f2")
+    progress_frame.pack(pady=(4, 6), fill="x")
+
+    progress_label = tk.Label(
+        progress_frame,
+        textvariable=progress_var,
+        font=("Segoe UI", 9, "bold"),
+        bg="#f2f2f2",
+        anchor="w",
     )
-    open_button.pack(pady=(0, 18))
+    progress_label.pack(anchor="w", padx=12)
+
+    progress_bar = ttk.Progressbar(
+        progress_frame,
+        orient="horizontal",
+        mode="determinate",
+        length=360,
+    )
+    progress_bar.pack(fill="x", padx=12, pady=(2, 6))
+
+    status_label = tk.Label(
+        progress_frame,
+        textvariable=status_var,
+        font=("Segoe UI", 9),
+        bg="#f2f2f2",
+        anchor="w",
+        wraplength=460,
+        justify="left",
+    )
+    status_label.pack(anchor="w", padx=12, pady=(0, 8))
+
+    process_button: tk.Button
+    cancel_button: tk.Button
+    current_cancel_event: threading.Event | None = None
+
+    def set_processing_state(is_running: bool) -> None:
+        if is_running:
+            process_button.config(state=tk.DISABLED)
+            cancel_button.config(state=tk.NORMAL)
+        else:
+            process_button.config(state=tk.NORMAL)
+            cancel_button.config(state=tk.DISABLED)
+
+    def update_progress(processed: int, total: int) -> None:
+        def _update() -> None:
+            total_for_bar = max(total, 1)
+            progress_bar.config(maximum=total_for_bar)
+            progress_bar["value"] = processed
+            progress_var.set(f"Progreso: {processed}/{total}")
+
+        root.after(0, _update)
+
+    def update_status(text: str) -> None:
+        root.after(0, lambda: status_var.set(text))
+
+    def finish_processing(cancelled: bool, started: bool = True) -> None:
+        def _finish() -> None:
+            set_processing_state(False)
+            if not started:
+                progress_var.set("Progreso: 0/0")
+                progress_bar["value"] = 0
+                status_var.set("Listo para procesar.")
+                return
+            if cancelled and not status_var.get():
+                status_var.set("Proceso cancelado.")
+
+        root.after(0, _finish)
+
+    def cancel_processing() -> None:
+        nonlocal current_cancel_event
+        if current_cancel_event and not current_cancel_event.is_set():
+            current_cancel_event.set()
+            update_status("Cancelando proceso...")
+
+    def start_excel_processing() -> None:
+        nonlocal current_cancel_event
+        current_cancel_event = threading.Event()
+        set_processing_state(True)
+        update_progress(0, 0)
+        update_status("Selecciona un archivo de Excel...")
+        select_and_process_excel(
+            on_progress=update_progress,
+            on_status=update_status,
+            on_finish=finish_processing,
+            cancel_event=current_cancel_event,
+        )
 
     process_button = tk.Button(
         root,
@@ -198,50 +299,27 @@ def main() -> None:
         relief=tk.FLAT,
         padx=16,
         pady=8,
-        command=select_and_process_excel,
+        command=start_excel_processing,
         cursor="hand2",
     )
-    process_button.pack(pady=(0, 14))
+    process_button.pack(pady=(0, 10))
 
-    # Seccion para abrir detalle por codigo de venta
-    detail_frame = tk.Frame(root, bg="#f2f2f2")
-    detail_frame.pack(pady=(6, 12), fill="x")
-
-    code_label = tk.Label(
-        detail_frame,
-        text="Codigo de venta",
+    cancel_button = tk.Button(
+        root,
+        text="Cancelar proceso",
         font=("Segoe UI", 10, "bold"),
-        bg="#f2f2f2",
-        anchor="w",
-    )
-    code_label.pack(anchor="w", padx=12, pady=(0, 6))
-
-    sale_code_var = tk.StringVar()
-    code_entry = tk.Entry(
-        detail_frame,
-        textvariable=sale_code_var,
-        font=("Segoe UI", 11),
-        width=36,
-        relief=tk.SOLID,
-        borderwidth=1,
-    )
-    code_entry.pack(padx=12, fill="x", pady=(0, 10))
-
-    detail_button = tk.Button(
-        detail_frame,
-        text="Abrir detalle por codigo",
-        font=("Segoe UI", 10, "bold"),
-        bg="#4caf50",
+        bg="#e53935",
         fg="#fff",
-        activebackground="#43a047",
+        activebackground="#d32f2f",
         activeforeground="#fff",
         relief=tk.FLAT,
-        padx=14,
-        pady=10,
-        command=lambda: open_detail(sale_code_var.get()),
+        padx=16,
+        pady=8,
+        command=cancel_processing,
         cursor="hand2",
+        state=tk.DISABLED,
     )
-    detail_button.pack(padx=12, pady=(0, 4), fill="x")
+    cancel_button.pack(pady=(0, 12))
 
     root.mainloop()
 
@@ -313,51 +391,89 @@ async def open_detail_and_extract(code: str, url: str) -> None:
             pass
 
 
-async def process_excel(file_path: str) -> None:
+async def process_excel(
+    file_path: str,
+    on_progress=None,
+    on_status=None,
+    cancel_event: threading.Event | None = None,
+) -> bool:
+    def notify_status(message: str) -> None:
+        if on_status:
+            on_status(message)
+
+    def notify_progress(done: int, total: int) -> None:
+        if on_progress:
+            on_progress(done, total)
+
     if load_workbook is None:
-        print("[excel] Falta openpyxl. Instala con: pip install openpyxl")
-        return
+        msg = "[excel] Falta openpyxl. Instala con: pip install openpyxl"
+        print(msg)
+        notify_status("Falta openpyxl. Instala con: pip install openpyxl")
+        return False
     if async_playwright is None:
-        print("[excel] Falta Playwright. Instala con: pip install playwright && python -m playwright install")
-        return
+        msg = "[excel] Falta Playwright. Instala con: pip install playwright && python -m playwright install"
+        print(msg)
+        notify_status("Falta Playwright. Instala con: pip install playwright && python -m playwright install")
+        return False
     if REMOTE_DEBUG_PORT is None:
         print("[excel] No hay puerto de depuracion. Pulsa el boton de login primero.")
-        return
+        notify_status("No hay puerto de depuracion. Pulsa el boton de login primero.")
+        return False
     if not wait_for_port("localhost", REMOTE_DEBUG_PORT, attempts=10, delay=0.4):
         print(f"[excel] No se pudo alcanzar el puerto {REMOTE_DEBUG_PORT}.")
-        return
+        notify_status(f"No se pudo alcanzar el puerto {REMOTE_DEBUG_PORT}.")
+        return False
 
+    notify_status("Abriendo Excel...")
     try:
         wb = load_workbook(file_path)
     except Exception as exc:
         print(f"[excel] No se pudo abrir el archivo: {exc}")
-        return
+        notify_status(f"No se pudo abrir el archivo: {exc}")
+        return False
 
     if "Reporte" not in wb.sheetnames:
         print("[excel] No se encontro la hoja 'Reporte'.")
-        return
+        notify_status("No se encontro la hoja 'Reporte' en el Excel.")
+        return False
 
     ws = wb["Reporte"]
     max_row = ws.max_row
 
+    rows_to_process: list[tuple[int, str]] = []
+    for row_idx in range(2, max_row + 1):
+        channel = ws.cell(row=row_idx, column=6).value  # F
+        sale_code = ws.cell(row=row_idx, column=8).value  # H
+        if str(channel).strip().lower() != "mercadolibre":
+            continue
+        if not sale_code:
+            continue
+        rows_to_process.append((row_idx, sale_code))
+
+    total_rows = len(rows_to_process)
+    notify_progress(0, total_rows)
+    if total_rows == 0:
+        notify_status("No hay filas de MercadoLibre para procesar.")
+        print("[excel] No hay filas de MercadoLibre para procesar.")
+        return False
+
     endpoint = f"http://localhost:{REMOTE_DEBUG_PORT}"
     playwright = await async_playwright().start()
     processed = 0
+    cancelled = False
     try:
         browser = await playwright.chromium.connect_over_cdp(endpoint)
         if not browser.contexts:
             print("[excel] No hay contextos en Chrome. ¿Cerraste la ventana de login?")
-            return
+            notify_status("No hay contextos en Chrome. ¿Cerraste la ventana de login?")
+            return False
         context = browser.contexts[0]
 
-        for row_idx in range(2, max_row + 1):
-            channel = ws.cell(row=row_idx, column=6).value  # F
-            if str(channel).strip().lower() != "mercadolibre":
-                continue
-
-            sale_code = ws.cell(row=row_idx, column=8).value  # H
-            if not sale_code:
-                continue
+        for row_idx, sale_code in rows_to_process:
+            if cancel_event and cancel_event.is_set():
+                cancelled = True
+                notify_status(f"Proceso cancelado. Guardando archivo... ({processed}/{total_rows})")
+                break
 
             url = DETAIL_URL_TEMPLATE.format(code=sale_code)
             amount = await fetch_amount_for_code(context, sale_code, url)
@@ -372,14 +488,23 @@ async def process_excel(file_path: str) -> None:
             ws.cell(row=row_idx, column=25).value = w_val + amount  # Y
 
             processed += 1
+            notify_progress(processed, total_rows)
             print(f"[excel] Fila {row_idx} ({sale_code}) -> Envíos: {format_amount(amount)}")
 
         out_path = Path(file_path)
         output_file = out_path.with_name(f"{out_path.stem}_con_envios{out_path.suffix}")
         wb.save(output_file)
-        print(f"[excel] Listo. Filas procesadas: {processed}. Archivo guardado en: {output_file}")
+        if cancelled:
+            message = f"Proceso cancelado. Se procesaron {processed}/{total_rows}. Archivo: {output_file}"
+        else:
+            message = f"Listo. Filas procesadas: {processed}. Archivo guardado en: {output_file}"
+        print(f"[excel] {message}")
+        notify_status(message)
+        return cancelled
     except Exception as exc:
         print(f"[excel] Error procesando Excel: {exc}")
+        notify_status(f"Error procesando Excel: {exc}")
+        return False
     finally:
         try:
             await playwright.stop()
