@@ -298,7 +298,7 @@ def main() -> None:
 
     process_button = tk.Button(
         root,
-        text="Procesar Excel (MercadoLibre)",
+        text="Procesar Excel (ML y Walmart)",
         font=("Segoe UI", 10, "bold"),
         bg="#9c27b0",
         fg="#fff",
@@ -448,26 +448,55 @@ async def process_excel(
     ws = wb["Reporte"]
     max_row = ws.max_row
 
+    last_data_col = 0
+    for row in ws.iter_rows():
+        for cell in row:
+            value = cell.value
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            if cell.column > last_data_col:
+                last_data_col = cell.column
+
+    if last_data_col < 3:
+        notify_status("No se pudo detectar la ultima columna con datos.")
+        print("[excel] No se pudo detectar la ultima columna con datos.")
+        return False
+
+    w_col = last_data_col - 2
+    x_col = last_data_col - 1
+    y_col = last_data_col
+
     rows_to_process: list[tuple[int, str]] = []
+    walmart_groups: dict[str, list[int]] = {}
     for row_idx in range(2, max_row + 1):
         channel = ws.cell(row=row_idx, column=6).value  # F
         sale_code = ws.cell(row=row_idx, column=8).value  # H
-        if str(channel).strip().lower() != "mercadolibre":
-            continue
-        if not sale_code:
-            continue
-        rows_to_process.append((row_idx, sale_code))
+        channel_norm = str(channel).strip().lower()
+        if channel_norm == "mercadolibre":
+            if not sale_code:
+                continue
+            rows_to_process.append((row_idx, sale_code))
+        elif channel_norm == "walmart":
+            if not sale_code:
+                continue
+            code_key = str(sale_code).strip()
+            if not code_key:
+                continue
+            walmart_groups.setdefault(code_key, []).append(row_idx)
 
     total_rows = len(rows_to_process)
     notify_progress(0, total_rows)
     if total_rows == 0:
         notify_status("No hay filas de MercadoLibre para procesar.")
         print("[excel] No hay filas de MercadoLibre para procesar.")
-        return False
 
     endpoint = f"http://localhost:{REMOTE_DEBUG_PORT}"
     playwright = await async_playwright().start()
-    processed = 0
+    processed_ml = 0
+    processed_walmart = 0
+    total_walmart_rows = sum(len(rows) for rows in walmart_groups.values())
     cancelled = False
     try:
         browser = await playwright.chromium.connect_over_cdp(endpoint)
@@ -477,35 +506,91 @@ async def process_excel(
             return False
         context = browser.contexts[0]
 
-        for row_idx, sale_code in rows_to_process:
-            if cancel_event and cancel_event.is_set():
-                cancelled = True
-                notify_status(f"Proceso cancelado. Guardando archivo... ({processed}/{total_rows})")
-                break
+        if total_rows > 0:
+            notify_status("Procesando MercadoLibre...")
+            for row_idx, sale_code in rows_to_process:
+                if cancel_event and cancel_event.is_set():
+                    cancelled = True
+                    notify_status(f"Proceso cancelado. Guardando archivo... ({processed_ml}/{total_rows})")
+                    break
 
-            url = DETAIL_URL_TEMPLATE.format(code=sale_code)
-            amount = await fetch_amount_for_code(context, sale_code, url)
-            if amount is None:
-                amount = 0
+                url = DETAIL_URL_TEMPLATE.format(code=sale_code)
+                amount = await fetch_amount_for_code(context, sale_code, url)
+                if amount is None:
+                    amount = 0
 
-            ws.cell(row=row_idx, column=24).value = amount  # X
+                ws.cell(row=row_idx, column=x_col).value = amount  # X
 
-            w_raw = ws.cell(row=row_idx, column=23).value  # W
-            w_val = parse_amount(w_raw)
-            w_val = w_val if w_val is not None else 0
-            ws.cell(row=row_idx, column=25).value = w_val + amount  # Y
+                w_raw = ws.cell(row=row_idx, column=w_col).value  # W
+                w_val = parse_amount(w_raw)
+                w_val = w_val if w_val is not None else 0
+                ws.cell(row=row_idx, column=y_col).value = w_val + amount  # Y
 
-            processed += 1
-            notify_progress(processed, total_rows)
-            print(f"[excel] Fila {row_idx} ({sale_code}) -> Envíos: {format_amount(amount)}")
+                processed_ml += 1
+                notify_progress(processed_ml, total_rows)
+                print(f"[excel] Fila {row_idx} ({sale_code}) -> Envíos: {format_amount(amount)}")
+
+        if not cancelled and total_walmart_rows > 0:
+            notify_progress(0, total_walmart_rows)
+            notify_status("Procesando Walmart...")
+            for code_key, row_indices in walmart_groups.items():
+                if cancel_event and cancel_event.is_set():
+                    cancelled = True
+                    notify_status(
+                        f"Proceso cancelado. Guardando archivo... ({processed_walmart}/{total_walmart_rows})"
+                    )
+                    break
+
+                prices: list[int] = []
+                totals: list[int] = []
+                for row_idx in row_indices:
+                    price_val = parse_amount(ws.cell(row=row_idx, column=w_col).value)
+                    total_val = parse_amount(ws.cell(row=row_idx, column=y_col).value)
+                    prices.append(price_val if price_val is not None else 0)
+                    totals.append(total_val if total_val is not None else 0)
+
+                sum_prices = sum(prices)
+                group_total = max(totals) if totals else 0
+                diff = group_total - sum_prices
+                if diff < 0:
+                    diff = 0
+
+                first_row = row_indices[0]
+                for row_idx in row_indices:
+                    if cancel_event and cancel_event.is_set():
+                        cancelled = True
+                        break
+                    ws.cell(row=row_idx, column=x_col).value = 0  # Despacho
+                    processed_walmart += 1
+                    notify_progress(processed_walmart, total_walmart_rows)
+                if cancelled:
+                    notify_status(
+                        f"Proceso cancelado. Guardando archivo... ({processed_walmart}/{total_walmart_rows})"
+                    )
+                    break
+                if diff > 0:
+                    ws.cell(row=first_row, column=x_col).value = diff  # Despacho
+
+            if not cancelled:
+                notify_status("Walmart terminado.")
 
         out_path = Path(file_path)
         output_file = out_path.with_name(f"{out_path.stem}_con_envios{out_path.suffix}")
         wb.save(output_file)
         if cancelled:
-            message = f"Proceso cancelado. Se procesaron {processed}/{total_rows}. Archivo: {output_file}"
+            message = (
+                "Proceso cancelado. "
+                f"MercadoLibre: {processed_ml}/{total_rows}. "
+                f"Walmart: {processed_walmart}/{total_walmart_rows}. "
+                f"Archivo: {output_file}"
+            )
         else:
-            message = f"Listo. Filas procesadas: {processed}. Archivo guardado en: {output_file}"
+            message = (
+                "Listo. "
+                f"MercadoLibre: {processed_ml}/{total_rows}. "
+                f"Walmart: {processed_walmart}/{total_walmart_rows}. "
+                f"Archivo guardado en: {output_file}"
+            )
         print(f"[excel] {message}")
         notify_status(message)
         return cancelled
