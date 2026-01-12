@@ -369,12 +369,12 @@ async def open_detail_and_extract(code: str, url: str) -> None:
         page.set_default_timeout(20000)
         await page.goto(url, wait_until="domcontentloaded")
 
-        text = await extract_amount_text(page, "Envíos", timeout_ms=2000)
+        text = await extract_amount_text(page, "Envíos", timeout_ms=2000, fast_fail=True)
         source = "Envíos"
 
         if text is None:
             # Bonificaciones debería resolverse rápido si no hay Envíos; usa timeout corto
-            text = await extract_amount_text(page, "Bonificaciones", timeout_ms=1000)
+            text = await extract_amount_text(page, "Bonificaciones", timeout_ms=1000, fast_fail=True)
             source = "Bonificaciones" if text else None
 
         if text is None:
@@ -616,11 +616,11 @@ async def fetch_amount_for_code(context, code: str, url: str) -> int | None:
         page.set_default_timeout(20000)
         await page.goto(url, wait_until="domcontentloaded")
 
-        text = await extract_amount_text(page, "Envíos", timeout_ms=2000)
+        text = await extract_amount_text(page, "Envíos", timeout_ms=2000, fast_fail=True)
         source = "Envíos"
 
         if text is None:
-            text = await extract_amount_text(page, "Bonificaciones", timeout_ms=1000)
+            text = await extract_amount_text(page, "Bonificaciones", timeout_ms=1000, fast_fail=True)
             source = "Bonificaciones" if text else None
 
         if text is None:
@@ -713,13 +713,19 @@ def start_login_browser(start_url: str = LOGIN_URL) -> None:
         print("[login] No se pudo confirmar el puerto de depuracion. Reintenta.")
 
 
-async def extract_amount_text(page, title: str, timeout_ms: int = 15000) -> str | None:
+async def extract_amount_text(
+    page, title: str, timeout_ms: int = 15000, fast_fail: bool = False
+) -> str | None:
     """
     Intenta obtener el texto del subtotal para una fila con el titulo dado.
     """
     try:
         row = page.locator("div.sc-account-rows__row", has_text=title).first
-        await row.wait_for(state="attached", timeout=timeout_ms)
+        if fast_fail:
+            if await row.count() == 0:
+                return None
+        else:
+            await row.wait_for(state="attached", timeout=timeout_ms)
         text = await row.locator("span.sc-account-rows__row__subTotal").first.text_content()
         return text.strip() if text else None
     except PlaywrightTimeoutError:
